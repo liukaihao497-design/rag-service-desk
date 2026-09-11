@@ -1,0 +1,12 @@
+
+# Local files excluded from GitHub upload
+**/target/
+**/node_modules/
+**/.idea/
+**/log/
+**/logs/
+*.log
+*.class
+.env
+.env.*
+!.env.example

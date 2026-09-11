@@ -1,0 +1,172 @@
+-- ==============================================================================
+-- 智能客服系统 - 数据库初始化脚本
+-- ==============================================================================
+-- 业务表: 用户(sys_user)、订单(sys_order / sys_order_item)、权限(sys_permission)
+-- 向量表: vector_store 由 Spring AI PgVectorStore 自动创建
+-- ==============================================================================
+
+-- 启用pgvector扩展（向量搜索所需，Spring AI也会自动执行此命令）
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ========================
+-- vector_store 表扩展：添加 tsvector 全文检索列
+-- ========================
+-- PostgreSQL 16+ 支持 GENERATED ALWAYS AS 自动维护
+-- 老版本 PostgreSQL 请用 TRIGGER + tsvector_update_trigger() 替代
+ALTER TABLE IF EXISTS vector_store
+    ADD COLUMN IF NOT EXISTS ts_content tsvector
+    GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
+
+-- 创建 GIN 倒排索引加速全文检索
+CREATE INDEX IF NOT EXISTS idx_fts_ts_content ON vector_store USING GIN(ts_content);
+
+-- ========================
+-- 用户表
+-- ========================
+CREATE TABLE IF NOT EXISTS sys_user (
+    id          BIGSERIAL PRIMARY KEY,
+    username    VARCHAR(50) NOT NULL UNIQUE,
+    password    VARCHAR(100) NOT NULL,
+    email       VARCHAR(100),
+    phone       VARCHAR(20),
+    role        VARCHAR(20) DEFAULT 'USER',
+    status      INTEGER DEFAULT 1,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ========================
+-- 订单表
+-- ========================
+CREATE TABLE IF NOT EXISTS sys_order (
+    id           BIGSERIAL PRIMARY KEY,
+    order_no     VARCHAR(32) NOT NULL UNIQUE,
+    user_id      BIGINT NOT NULL,
+    total_amount NUMERIC(10,2) NOT NULL,
+    status       VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    create_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    description  VARCHAR(500)
+);
+
+-- ========================
+-- 订单明细表
+-- ========================
+CREATE TABLE IF NOT EXISTS sys_order_item (
+    id           BIGSERIAL PRIMARY KEY,
+    order_id     BIGINT NOT NULL,
+    product_name VARCHAR(100) NOT NULL,
+    quantity     INTEGER NOT NULL,
+    unit_price   NUMERIC(10,2) NOT NULL,
+    subtotal     NUMERIC(10,2) NOT NULL
+);
+
+-- ========================
+-- 权限表（支持树形结构）
+-- ========================
+CREATE TABLE IF NOT EXISTS sys_permission (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    code        VARCHAR(50) NOT NULL UNIQUE,
+    description VARCHAR(200),
+    type        VARCHAR(20) DEFAULT 'MENU',
+    parent_id   BIGINT DEFAULT 0,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ========================
+-- 示例数据
+-- ========================
+
+-- 用户数据
+INSERT INTO sys_user (username, password, email, phone, role, status) VALUES
+('zhangsan', 'pass123', 'zhangsan@example.com', '13800138001', 'ADMIN', 1),
+('lisi',     'pass456', 'lisi@example.com',     '13800138002', 'USER',  1),
+('wangwu',   'pass789', 'wangwu@example.com',   '13800138003', 'USER',  1),
+('zhaoliu',  'pass000', 'zhaoliu@example.com',  '13800138004', 'USER',  0)
+ON CONFLICT (username) DO NOTHING;
+
+-- 权限数据
+INSERT INTO sys_permission (name, code, description, type, parent_id) VALUES
+('系统管理',   'sys:manage',     '系统管理模块',      'MENU',   0),
+('用户管理',   'sys:user:list',  '查看用户列表',      'MENU',   1),
+('用户新增',   'sys:user:add',   '新增用户权限',      'BUTTON', 1),
+('订单管理',   'order:manage',   '订单管理模块',      'MENU',   0),
+('订单查看',   'order:view',     '查看订单列表',      'MENU',   4),
+('订单导出',   'order:export',   '导出订单数据',      'BUTTON', 4),
+('知识库管理', 'kb:manage',      '知识库管理模块',    'MENU',   0),
+('文档上传',   'kb:upload',      '上传知识库文档',    'BUTTON', 7)
+ON CONFLICT (code) DO NOTHING;
+
+-- 订单数据
+INSERT INTO sys_order (order_no, user_id, total_amount, status, description) VALUES
+('ORD20260101001', 1, 5299.00,  'COMPLETED',  '购买智能客服企业版年度授权'),
+('ORD20260115002', 2, 199.00,   'COMPLETED',  '购买云存储100GB套餐'),
+('ORD20260201003', 1, 99.00,    'SHIPPED',    '购买自定义域名服务'),
+('ORD20260215004', 3, 299.00,   'PENDING',    '购买多语言支持包'),
+('ORD20260301005', 2, 12999.00, 'REFUNDING',  '购买私有化部署方案')
+ON CONFLICT (order_no) DO NOTHING;
+
+-- 订单明细
+INSERT INTO sys_order_item (order_id, product_name, quantity, unit_price, subtotal) VALUES
+(1, '智能客服企业版-年付',   1, 4999.00, 4999.00),
+(1, '高级模板包',            1,  300.00,  300.00),
+(2, '云存储100GB',           1,  199.00,  199.00),
+(3, '自定义域名-年付',       1,   99.00,   99.00),
+(4, '多语言支持包-年付',     1,  299.00,  299.00),
+(5, '私有化部署标准版',      1, 12999.00, 12999.00)
+ON CONFLICT DO NOTHING;
+
+-- ========================
+-- 对话历史表（长期记忆）
+-- ========================
+CREATE TABLE IF NOT EXISTS chat_history (
+    id              BIGSERIAL PRIMARY KEY,
+    session_id      VARCHAR(64) NOT NULL,
+    role            VARCHAR(20) NOT NULL,
+    content         TEXT NOT NULL,
+    message_index   INTEGER NOT NULL,
+    token_count     INTEGER,
+    create_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    compressed      BOOLEAN DEFAULT FALSE
+);
+
+-- 索引优化：加速会话查询
+CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id, message_index);
+
+-- ========================
+-- 用户事实表（画像记忆 Layer 2）
+-- ========================
+-- 结构化事实存储，永不压缩，只 UPSERT
+-- 解决滚动摘要的"信息衰减"问题
+CREATE TABLE IF NOT EXISTS user_fact (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    fact_key     VARCHAR(64) NOT NULL,
+    fact_value   VARCHAR(500) NOT NULL,
+    category     VARCHAR(20) DEFAULT 'ENTITY',
+    importance   INTEGER DEFAULT 3,
+    create_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, fact_key)
+);
+
+-- 索引优化：加速事实查询
+CREATE INDEX IF NOT EXISTS idx_user_fact_session ON user_fact(session_id);
+
+-- ========================
+-- 知识库索引追踪表（增量同步核心）
+-- ========================
+-- 记录每个源文件的索引状态，用于增量同步时判断文档是否需要重新向量化
+CREATE TABLE IF NOT EXISTS knowledge_base_index (
+    id               BIGSERIAL PRIMARY KEY,
+    source_file      VARCHAR(500) NOT NULL UNIQUE,
+    content_hash     VARCHAR(64) NOT NULL,
+    chunk_ids        TEXT,
+    chunk_count      INTEGER NOT NULL,
+    file_modified_at TIMESTAMP,
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
